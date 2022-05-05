@@ -24,5 +24,9 @@ executable third
                        http-types,
                        text,
                        aeson,
-                       mtl
+                       mtl,
+                       containers,
+                       time,
+                       stm,
+                       lucid
                      

@@ -1,57 +1,173 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# language OverloadedStrings #-}
 
-import qualified Data.ByteString.Lazy as B
-import GHC.Generics
-import Web.Scotty
-import Network.HTTP.Types
-import Control.Monad.Trans (liftIO)
-import Article 
-import Data.Maybe
+module Main where
 
-import Data.Monoid ((<>))
-import Data.Aeson (FromJSON, ToJSON)
-import Control.Applicative
-import Matheg
+import qualified Web.Scotty as S
+import qualified Data.Text.Lazy as TL
+import qualified Data.Time.Clock as C
+import qualified Data.Map as M
+import qualified Network.HTTP.Types as HTTP
+import qualified Control.Concurrent.STM as STM
+import Control.Monad.IO.Class (liftIO)
+import qualified Lucid as H
 
-fu = do
-      article <- jsonData :: ActionM Article -- Decode body of the POST request as an Article object
-      liftIO $ print article
-      json article                           -- Send the encoded object back as JSON
+-----------
+-- Types --
+-----------
 
-greet m = (show.name) m ++" was born in the year "++ (show.born) m
+data Post
+  = Post
+    { pTime :: C.UTCTime
+    , pAuthor :: TL.Text
+    , pTitle :: TL.Text
+    , pContent :: TL.Text
+    }
 
-main = scotty 3000 myApp
+type Posts = M.Map Integer Post
 
-myApp = do
-    get "/" $ do
-      text "This is GET REQUEST"
-    delete "/" $ do
-      html "This is DELETE REQUEST"
-    post "/" $ do
-      text "This is post request"
-    put "/" $ do 
-      text "This is put request"
-    post "/set-headers" $ do
-      status status302
-      setHeader "Location" "http://www.google.com"
-    get "/askfor/:word" $ do
-      w <- param "word"
-      html $ mconcat ["<h1> you asked for", w, ", you got it </h1>"]
-    post "/submit" $ do
-      name <- param "name"
-      text name
-    matchAny "/all" $ do
-      text "matches all method"
-    -- get article (json)
-    get "/article" $ do
-      json $ Article 13 "caption" "content" -- Call Article constructor and encode the result as JSON
-    -- post article (json)
-    post "/article" fu
-    notFound $ do
-      text "not found such route"
+data MyState
+  = MyState
+    { msId :: Integer
+    , msPosts :: Posts
+    }
 
-    
+------------------------
+-- Runner and Routing --
+------------------------
 
-     
+main :: IO ()
+main = do
+  posts <- makeDummyPosts
+  mystateVar <- STM.newTVarIO MyState{msId = 1, msPosts = posts}
+  S.scotty 3000 (myApp mystateVar)
+
+myApp :: STM.TVar MyState -> S.ScottyM ()
+myApp mystateVar = do
+  -- Our main page to display blogs
+  S.get "/" $ do
+    posts <- liftIO $ msPosts <$> STM.readTVarIO mystateVar
+    S.text $ TL.unlines $ map ppPost $ M.elems posts
+
+  -- A page for a specific post
+  S.get "/post/:id" $ do
+    pid <- S.param "id"
+    posts <- liftIO $ msPosts <$> STM.readTVarIO mystateVar
+    case M.lookup pid posts of
+      Just post ->
+        S.text $ ppPost post
+
+      Nothing -> do
+        S.status HTTP.notFound404
+        S.text "404 Not Found."
+
+  -- A request to submit a new page
+  S.post "/new" $ do
+    title <- S.param "title"
+    author <- S.param "author"
+    content <- S.param "content"
+    time <- liftIO C.getCurrentTime
+    pid <- liftIO $ newPost
+      ( Post
+        { pTime = time
+        , pAuthor = author
+        , pTitle = title
+        , pContent = content
+        }
+      )
+      mystateVar
+    S.redirect ("/post/" <> TL.pack (show pid))
+
+  -- A request to submit a new page
+  S.post "/new" $ do
+    title <- S.param "title"
+    author <- S.param "author"
+    content <- S.param "content"
+    time <- liftIO C.getCurrentTime
+    pid <- liftIO $ newPost
+      ( Post
+        { pTime = time
+        , pAuthor = author
+        , pTitle = title
+        , pContent = content
+        }
+      )
+      mystateVar
+    S.redirect ("/post/" <> TL.pack (show pid))
+
+  -- A request to delete a specific post
+  S.post "/post/:id/delete" $ do
+    pid <- S.param "id"
+    exists <- liftIO $ STM.atomically $ do
+      mystate <- STM.readTVar mystateVar
+      case M.lookup pid (msPosts mystate) of
+        Just{} -> do
+          STM.writeTVar
+            mystateVar
+            ( mystate
+              { msPosts = M.delete pid (msPosts mystate)
+              }
+            )
+          pure True
+
+        Nothing ->
+          pure False
+    if exists
+      then
+        S.redirect "/"
+
+      else do
+        S.status HTTP.notFound404
+        S.text "404 Not Found."
+
+newPost :: Post -> STM.TVar MyState -> IO Integer
+newPost post mystateVar = do
+  STM.atomically $ do
+    mystate <- STM.readTVar mystateVar
+    STM.writeTVar
+      mystateVar
+      ( mystate
+        { msId = msId mystate + 1
+        , msPosts = M.insert (msId mystate) post (msPosts mystate)
+        }
+      )
+    pure (msId mystate)
+
+-----------
+-- Utils --
+-----------
+
+makeDummyPosts :: IO Posts
+makeDummyPosts = do
+  time <- C.getCurrentTime
+  pure $
+    M.singleton
+      0
+      ( Post
+        { pTime = time
+        , pTitle = "Title 1"
+        , pAuthor = "Author 2"
+        , pContent = "Content 3"
+        }
+      )
+
+ppPost :: Post -> TL.Text
+ppPost post =
+  let
+    header =
+      TL.unwords
+        [ "[" <> TL.pack (show (pTime post)) <> "]"
+        , pTitle post
+        , "by"
+        , pAuthor post
+        ]
+    seperator =
+      TL.replicate (TL.length header) "-"
+  in
+    TL.unlines
+      [ seperator
+      , header
+      , seperator
+      , pContent post
+      , seperator
+      ]
+
